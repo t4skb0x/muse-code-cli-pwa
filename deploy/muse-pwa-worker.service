@@ -1,10 +1,15 @@
 [Unit]
-Description=muse-pwa task worker (headless muse exec for phone tasks)
+Description=Muse Code CLI PWA task worker (headless muse exec for phone tasks)
 After=muse-pwa.service
+
 [Service]
-ExecStart=/usr/bin/python3 /home/algoprints/muse-pwa/worker.py
-WorkingDirectory=/home/algoprints/muse-pwa
+# Adjust to wherever you cloned this repo. Keep MUSE_PWA_WORKSPACE in sync
+# with muse-pwa.service if you overrode it there.
+ExecStart=/usr/bin/python3 %h/muse-code-cli-pwa/worker.py
+WorkingDirectory=%h/muse-code-cli-pwa
+# Environment=MUSE_PWA_WORKSPACE=%h/projects
 Restart=always
 RestartSec=5
+
 [Install]
 WantedBy=default.target
