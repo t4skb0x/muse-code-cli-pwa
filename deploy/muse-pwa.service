@@ -1,10 +1,19 @@
 [Unit]
-Description=muse-pwa origin (iPhone full-remote: chat/files/terminal/diff)
+Description=Muse Code CLI PWA origin server (phone remote: chat/files/terminal/tasks)
 After=network.target
+
 [Service]
-ExecStart=/usr/bin/python3 /home/algoprints/muse-pwa/server.py
-WorkingDirectory=/home/algoprints/muse-pwa
+# Adjust APP_DIR to wherever you cloned this repo.
+Environment=APP_DIR=%h/muse-code-cli-pwa
+ExecStart=/usr/bin/python3 %h/muse-code-cli-pwa/server.py
+WorkingDirectory=%h/muse-code-cli-pwa
+# Optional: scope the Files tab and task repos to a project folder instead
+# of your whole home directory:
+# Environment=MUSE_PWA_WORKSPACE=%h/projects
+# Optional: bind a different port:
+# Environment=MUSE_PWA_PORT=3091
 Restart=always
 RestartSec=3
+
 [Install]
 WantedBy=default.target
