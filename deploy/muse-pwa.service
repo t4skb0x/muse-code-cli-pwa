@@ -1,0 +1,10 @@
+[Unit]
+Description=muse-pwa origin (iPhone full-remote: chat/files/terminal/diff)
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 /home/algoprints/muse-pwa/server.py
+WorkingDirectory=/home/algoprints/muse-pwa
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target
