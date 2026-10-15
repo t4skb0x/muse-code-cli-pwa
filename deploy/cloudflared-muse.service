@@ -1,0 +1,10 @@
+[Unit]
+Description=cloudflared connector for muse.ridgestate.com (muse-pwa tunnel)
+After=network-online.target muse-pwa.service
+Wants=network-online.target
+[Service]
+ExecStart=/home/algoprints/.local/bin/cloudflared tunnel run --token-file /home/algoprints/.cloudflared/muse-pwa.token
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target
