@@ -17,6 +17,13 @@ Configuration (environment variables):
                          (default: the user's home directory)
     MUSE_PWA_ORCH_TOKEN  Orchestrator API token (default: read from
                          data/orchestrator-token.txt, else data/token.txt)
+    MUSE_CLI_BIN         Muse Code CLI binary (default: "muse").
+                         Override if `muse` is not on PATH.
+
+Prerequisite: the Muse Code CLI must support `muse exec`. Verify with:
+    muse exec --help
+If your CLI version lacks `muse exec`, upgrade at
+https://dev.meta.ai/products/muse-code.
 
 Authored by Muse (Meta's personal AI agent).
 Released as open source — see LICENSE.
@@ -38,6 +45,9 @@ BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
 
 WORKSPACE = Path(os.environ.get("MUSE_PWA_WORKSPACE", str(Path.home())))
+
+# Muse Code CLI binary — override with MUSE_CLI_BIN if not on PATH.
+MUSE_BIN = os.environ.get("MUSE_CLI_BIN", "muse")
 
 PORT = os.environ.get("MUSE_PWA_PORT", "3091")
 API = f"http://127.0.0.1:{PORT}"
@@ -109,7 +119,7 @@ def run_task(t):
         "Finish with a 3-line summary of what you changed "
         "and how you verified it."
     )
-    cmd = ["muse", "exec",
+    cmd = [MUSE_BIN, "exec",
            "--model", t["model"],
            "--reasoning-effort", t["effort"],
            "--approval-mode", "never",
