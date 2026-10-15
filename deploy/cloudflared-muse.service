@@ -1,10 +1,14 @@
 [Unit]
-Description=cloudflared connector for muse.ridgestate.com (muse-pwa tunnel)
+Description=Cloudflare Tunnel connector for the Muse Code CLI PWA
 After=network-online.target muse-pwa.service
 Wants=network-online.target
+
 [Service]
-ExecStart=/home/algoprints/.local/bin/cloudflared tunnel run --token-file /home/algoprints/.cloudflared/muse-pwa.token
+# Uses a remotely-managed tunnel token. Create it once in the Cloudflare
+# dashboard (Zero Trust → Networks → Tunnels) and save it to the path below.
+ExecStart=%h/.local/bin/cloudflared tunnel run --token-file %h/.cloudflared/muse-pwa.token
 Restart=always
 RestartSec=5
+
 [Install]
 WantedBy=default.target
