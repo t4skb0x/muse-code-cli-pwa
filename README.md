@@ -24,8 +24,8 @@ Phone (PWA) → Cloudflare Tunnel → this server (127.0.0.1:3091)
 ## Requirements
 
 - Python 3.10+ (standard library only — no pip packages)
-- [Muse Code CLI](https://www.meta.ai/code) installed (`muse` on PATH)
-- [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) for the public tunnel
+- [Muse Code CLI](https://dev.meta.ai/products/muse-code) installed (`muse` on PATH)
+- [Cloudflare](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) for the public tunnel
 - A Cloudflare account (free tier works) for Tunnel + Access
 
 ## Quick start
