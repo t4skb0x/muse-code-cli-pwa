@@ -65,7 +65,7 @@ POK=$(echo "$PUT" | python3 -c "import json,sys;print(json.load(sys.stdin).get('
 echo "step2c: policy $POL_ID swapped to new token; polling edge for propagation (want 200 on /api/health):"
 H=""
 for i in $(seq 1 12); do
-  H=$(curl -s -o /dev/null -w '%{http_code}' -H "CF-Access-Client-Id: $NEW_ID" -H "CF-Access-Client-Secret: $NEW_SECRET" https://muse.ridgestate.com/api/health)
+  H=$(curl -s -o /dev/null -w '%{http_code}' -H "CF-Access-Client-Id: $NEW_ID" -H "CF-Access-Client-Secret: $NEW_SECRET" https://${PWA_HOSTNAME:?set PWA_HOSTNAME}/api/health)
   echo "  poll $i: $H"
   [ "$H" = "200" ] && break
   sleep 10
@@ -91,7 +91,7 @@ echo "local orch POST /api/exec: $(code -X POST -H "Authorization: Bearer $NEW_O
 echo "local oper GET /api/me: $(code -H "Authorization: Bearer $OPTOK" http://127.0.0.1:3091/api/me) (want 200)"
 
 # --- Step 4: edge chain (fresh vs wrong-secret control; both carry the orch Bearer) ---
-EDGE=https://muse.ridgestate.com
+EDGE=https://${PWA_HOSTNAME:?set PWA_HOSTNAME}
 GOOD=$(code -H "CF-Access-Client-Id: $CLIENT_ID" -H "CF-Access-Client-Secret: $NEW_SECRET" -H "Authorization: Bearer $NEW_ORCH" "$EDGE/api/me")
 BAD=$(code -H "CF-Access-Client-Id: $CLIENT_ID" -H "CF-Access-Client-Secret: WRONGSECRET00000000000000000000000000000000" -H "Authorization: Bearer $NEW_ORCH" "$EDGE/api/me")
 GATE=$(code "$EDGE/api/me")
