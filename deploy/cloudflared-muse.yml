@@ -1,0 +1,11 @@
+# cloudflared ingress for muse.ridgestate.com — merge into the vivobook tunnel
+# config (named tunnel) or run as its own tunnel. Tunnel itself is free.
+# Create once (needs shell): cloudflared tunnel create muse-pwa
+# Then fill your tunnel UUID below.
+# Route DNS (free):        cloudflared tunnel route dns muse-pwa muse.ridgestate.com
+tunnel: <tunnel-uuid>
+# LIVE mode is remotely-managed: connector runs with --token-file ~/.cloudflared/muse-pwa.token (see cloudflared-muse.service); this file documents the same ingress.
+ingress:
+  - hostname: muse.ridgestate.com
+    service: http://127.0.0.1:3091
+  - service: http_status:404
