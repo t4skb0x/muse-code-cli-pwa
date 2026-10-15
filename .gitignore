@@ -1,0 +1,8 @@
+# Runtime state and secrets — never commit
+data/
+__pycache__/
+*.pyc
+*.pyo
+*.env
+*.token
+.secrets/
