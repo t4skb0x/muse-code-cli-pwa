@@ -1,0 +1,8 @@
+# muse-pwa — MASTER
+- Purpose: operator iPhone (PWA) full-remote collaboration with the Muse terminal session: chat, file browse/edit, terminal, git diff.
+- Flow: iPhone Safari/PWA → https://muse.ridgestate.com (CF edge, Universal SSL) → cloudflared (outbound-only) → 127.0.0.1:3091 `server.py` → /home/algoprints.
+- Cost: $0 — Tunnel/DNS free; no Worker in path (Workers Free 100k req/day unused by design).
+- Files: server.py · worker.py (claims tasks, runs `muse exec --approval-mode never --trust-workspace`; auto=direct, approve=isolated worktree + held patch) · static/ (Chat/Tasks/Files/Terminal/Diff) · data/ (chat, tasks, goals, audit, patches, worktrees) · deploy/ (3 systemd units + tunnel ingress + rotate-credentials.sh).
+- Tokens: operator (`data/token.txt`, everything incl. exec/files/approve) vs orchestrator (`data/orchestrator-token.txt`, tasks/goals/chat/claim/update only — no exec, no files, no approvals). Worker runs on the orchestrator token.
+- Model default (operator 2026-10-15): `muse-spark-1.3-contributor` ONLY — server default + PWA picker; phone override field retained for explicit per-task override. Live-verified: empty-model task stored + read back spark id.
+- External agent chain: Cloudflare Access service token `muse-pwa-orchestrator` + policy "Orchestrator service auth" (decision MUST be non_identity — `allow` is accepted by API but never matches, edge 403) + app orchestrator Bearer. Creds: ~/.cloudflared/muse-pwa-svctoken.env + data/orchestrator-token.txt (0600, never in docs).
