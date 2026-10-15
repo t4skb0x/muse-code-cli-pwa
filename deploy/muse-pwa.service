@@ -5,8 +5,8 @@ After=network.target
 [Service]
 # Adjust APP_DIR to wherever you cloned this repo.
 Environment=APP_DIR=%h/muse-code-cli-pwa
-ExecStart=/usr/bin/python3 %h/muse-code-cli-pwa/server.py
-WorkingDirectory=%h/muse-code-cli-pwa
+ExecStart=/usr/bin/python3 ${APP_DIR}/server.py
+WorkingDirectory=${APP_DIR}
 # Optional: scope the Files tab and task repos to a project folder instead
 # of your whole home directory:
 # Environment=MUSE_PWA_WORKSPACE=%h/projects
