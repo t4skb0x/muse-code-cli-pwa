@@ -4,10 +4,10 @@
 # (client_id unchanged, policy untouched), (2) PWA orchestrator Bearer
 # (regen + restart server/worker, which load tokens once at startup).
 # Fresh values print to STDOUT ONLY — never persisted. No secret literals in this file.
-# Run: bash ~/muse-pwa/deploy/rotate-credentials.sh
+# Run: bash ~/muse-code-cli-pwa/deploy/rotate-credentials.sh
 set -euo pipefail
 
-MPWA=~/muse-pwa
+MPWA=~/muse-code-cli-pwa
 ENV_FILE=~/.cloudflared/muse-pwa-svctoken.env
 ORCH_FILE=$MPWA/data/orchestrator-token.txt
 # NOTE: tunnel is remotely-managed → no local credentials/AccountTag file exists.
