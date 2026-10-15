@@ -27,7 +27,7 @@ setInterval(() => { if (!$("#tab-chat").hidden && !$("#app").hidden) loadChat();
 async function loadFiles(dir) {
   curDir = dir;
   const d = await api("/api/files?path=" + encodeURIComponent(dir));
-  $("#cwdLabel").textContent = "/home/algoprints/" + (d.path === "." ? "" : d.path);
+  $("#cwdLabel").textContent = "" + (d.path === "." ? "" : d.path);
   const up = dir ? `<li class="dir" data-up="1">.. up</li>` : "";
   $("#fileList").innerHTML = up + d.items.map(i => `<li class="${i.dir ? "dir" : ""}" data-name="${esc(i.name)}" data-dir="${i.dir}">${esc(i.name)}${i.dir ? "/" : " · " + i.size + "B"}</li>`).join("");
   document.querySelectorAll("#fileList li").forEach(li => li.onclick = () => {
