@@ -4,23 +4,23 @@
 <meta name="theme-color" content="#101418">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Muse Remote</title>
+<title>Muse Code CLI PWA</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <link rel="stylesheet" href="/style.css">
 </head><body>
-<div id="login"><h1>Muse Remote</h1><p>Operator token required. Find it in <code>muse-pwa/data/token.txt</code> on vivobook (or the <code>MUSE_PWA_TOKEN</code> env).</p>
+<div id="login"><h1>Muse Code CLI PWA</h1><p>Operator token required. Find it in <code>data/token.txt</code> (or the <code>MUSE_PWA_TOKEN</code> env).</p>
 <input id="tok" type="password" autocomplete="current-password" placeholder="Access token">
 <button id="loginBtn">Unlock</button><p id="loginErr"></p></div>
 <main id="app" hidden>
-<header><strong>Muse Remote</strong><span id="cwdLabel">/home/algoprints</span><button id="logout">Lock</button></header>
+<header><strong>Muse Code CLI PWA</strong><span id="cwdLabel"></span><button id="logout">Lock</button></header>
 <nav><button data-tab="chat" class="on">Chat</button><button data-tab="tasks">Tasks</button><button data-tab="files">Files</button><button data-tab="term">Terminal</button><button data-tab="diff">Diff</button></nav>
 <section id="tab-chat"><div id="msgs"></div><form id="chatForm"><input id="chatIn" placeholder="Message for Muse session…" autocomplete="off"><button>Send</button></form><p class="hint">Messages persist to <code>data/chat.jsonl</code>; the terminal Muse session reads/replies there. Polls every 3s.</p></section>
 <section id="tab-tasks" hidden>
 <h3>Goal</h3><form id="goalForm"><input id="goalIn" placeholder="New goal objective…"><button>Set goal</button></form><div id="goalList"></div>
 <h3>New task</h3><textarea id="taskIn" rows="3" placeholder="Coding task for a headless Muse session…"></textarea>
-<label>Repo <input id="taskRepo" value="muse-pwa"></label>
+<label>Repo <input id="taskRepo" value="" placeholder="repo folder name"></label>
 <label>Model <select id="taskModel"><option>muse-spark-1.3-contributor</option></select><input id="taskModelFree" placeholder="override model id (optional)"></label>
 <label>Effort <select id="taskEffort"><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label>
 <label>Mode <select id="taskAuto"><option value="auto" selected>Full auto (runs, posts result)</option><option value="approve">Approve (worktree, hold diff)</option></select></label>
