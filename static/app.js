@@ -61,7 +61,7 @@ async function loadGoals() {
 async function goalUpdate(id, status, percent) { await api("/api/goals/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, status, ...(percent !== null ? { percent } : {}) }) }); loadGoals(); }
 $("#goalForm").onsubmit = async e => { e.preventDefault(); await api("/api/goals", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ objective: $("#goalIn").value }) }); $("#goalIn").value = ""; loadGoals(); };
 $("#taskBtn").onclick = async () => {
-  const model = $("#taskModelFree").value.trim() || $("#taskModel").value;
+  const model = $("#taskModel").value.trim();
   await api("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("#taskIn").value, repo: $("#taskRepo").value, model, effort: $("#taskEffort").value, autonomy: $("#taskAuto").value, goal_id: $("#taskGoal").value }) });
   $("#taskIn").value = ""; loadTasks();
 };
