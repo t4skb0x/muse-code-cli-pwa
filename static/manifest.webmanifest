@@ -1,1 +1,1 @@
-{"name":"Muse Remote","short_name":"Muse","start_url":"/","display":"standalone","background_color":"#101418","theme_color":"#101418","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
+{"name":"Muse Code CLI PWA","short_name":"Muse PWA","start_url":"/","display":"standalone","background_color":"#101418","theme_color":"#101418","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
