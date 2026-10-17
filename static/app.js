@@ -106,10 +106,27 @@ async function loadTasks() {
   document.querySelectorAll("[data-tr]").forEach(b => b.onclick = () => taskVerdict(b.dataset.tr, "reject"));
   document.querySelectorAll("[data-retry]").forEach(b => b.onclick = () => taskRetry(b.dataset.retry));
   document.querySelectorAll("[data-tx]").forEach(b => b.onclick = () => { const p = $("#tres-" + b.dataset.tx); p.hidden = !p.hidden; b.textContent = p.hidden ? "expand" : "collapse"; if (p.hidden) expandedIds.delete(b.dataset.tid); else expandedIds.add(b.dataset.tid); });
+  loadOrchestrator();
   loadWorkers();
 }
 async function taskVerdict(id, v) { await api("/api/tasks/" + v, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }); loadTasks(); }
 async function taskRetry(id) { const d = await api("/api/tasks/retry", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }); if (d.error) alert(d.error); loadTasks(); }
+function fmtShortAgo(ts, now) {
+  if (!ts) return "never";
+  const s = Math.max(0, now - ts);
+  if (s < 60) return s + "s ago";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m ago";
+  return Math.floor(m / 60) + "h ago";
+}
+async function loadOrchestrator() {
+  try {
+    const d = await api("/api/orchestrator/status");
+    const dead = d.status === "dead";
+    const ago = d.last_heartbeat ? fmtShortAgo(d.last_heartbeat, d.now) : "never";
+    $("#orchPanel").innerHTML = `<div class="msg"${dead ? ' style="border-color:var(--bad)"' : ""}><small>SPARK ORCHESTRATOR · ${dead ? "DEAD" : "ALIVE"}</small>Spark last update: ${esc(ago)}${dead ? ' · <strong style="color:var(--bad)">STALE — no heartbeat for over 6 minutes</strong>' : ""}</div>`;
+  } catch (e) {}
+}
 async function loadWorkers() {
   try {
     const d = await api("/api/workers");
@@ -178,6 +195,6 @@ setInterval(() => {
     el.textContent = "elapsed " + fmtDur(s);
   });
 }, 1000);
-setInterval(() => { if (!$("#tab-tasks").hidden && !$("#app").hidden) { loadTasks(); loadGoals(); loadMonitors(); } }, 5000);
+setInterval(() => { if (!$("#tab-tasks").hidden && !$("#app").hidden) { loadTasks(); loadGoals(); loadMonitors(); loadOrchestrator(); } }, 5000);
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
 api("/api/me").then(showApp).catch(showLogin);
