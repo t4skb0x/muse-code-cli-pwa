@@ -117,6 +117,7 @@ ORCH_PATHS = (
     "/api/tasks/heartbeat", "/api/tasks/progress", "/api/tasks/retry",
     "/api/tasks/log", "/api/tasks/death",
     "/api/workers",
+    "/api/orchestrator/heartbeat", "/api/orchestrator/status",
     "/api/goals", "/api/goals/update",
     "/api/files", "/api/file",
 )
@@ -648,6 +649,47 @@ def note_worker(workers: dict, worker: str, task_id=None, pid=None,
     return e
 
 
+# ---------------------------------------------------------------------------
+# Orchestrator (Spark) heartbeat — "who watches the watcher"
+# ---------------------------------------------------------------------------
+
+ORCH_HEARTBEAT_DEAD = 360  # no heartbeat for this long => orchestrator is dead
+
+
+def record_orchestrator_heartbeat(timestamp=None, status="", now=None) -> dict:
+    """Build the orchestrator heartbeat record for data/orchestrator.json."""
+    now = int(now if now is not None else time.time())
+    try:
+        ts = int(timestamp) if timestamp is not None else now
+    except (TypeError, ValueError):
+        ts = now
+    if ts <= 0:
+        ts = now
+    return {"last_heartbeat": ts,
+            "status": str(status or "").strip()[:80] or "ok",
+            "updated_at": now}
+
+
+def orchestrator_status(record=None, now=None) -> dict:
+    """Status view: last heartbeat, age, alive/dead.
+
+    Dead when never seen or when the last heartbeat is older than
+    ORCH_HEARTBEAT_DEAD seconds (6 minutes).
+    """
+    now = int(now if now is not None else time.time())
+    try:
+        hb = int((record or {}).get("last_heartbeat") or 0) or None
+    except (TypeError, ValueError):
+        hb = None
+    age = (now - hb) if hb is not None else None
+    alive = hb is not None and age <= ORCH_HEARTBEAT_DEAD
+    return {"last_heartbeat": hb,
+            "seconds_since": age,
+            "status": "alive" if alive else "dead",
+            "reported_status": str((record or {}).get("status") or ""),
+            "now": now}
+
+
 def filter_tasks(tasks, status="") -> list:
     """Keep only tasks with the given status ("" keeps everything)."""
     s = str(status or "").strip().lower()
@@ -1065,6 +1107,13 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json({"error": "unknown worker"}, 404)
             return self.send_json(st)
 
+        if path == "/api/orchestrator/status":
+            # GET /api/orchestrator/status: last Spark heartbeat, age,
+            # alive/dead. Reads data/orchestrator.json (persistent).
+            with LOCK:
+                record = load_json("orchestrator.json", {})
+            return self.send_json(orchestrator_status(record))
+
         if path.startswith("/api/tasks/") and path.endswith("/log"):
             # GET /api/tasks/<id>/log?lines=N: tail worker output.
             from urllib.parse import unquote
@@ -1248,6 +1297,18 @@ class H(BaseHTTPRequestHandler):
                 save_json("tasks.json", tasks)
                 return self.send_json({"ok": True,
                                        "heartbeat_at": t["heartbeat_at"]})
+
+        if u.path == "/api/orchestrator/heartbeat":
+            # Spark sign of life: {timestamp?, status?}. Persisted to
+            # data/orchestrator.json (survives restarts), not just memory.
+            # No audit line: like worker heartbeats, this fires every
+            # few minutes and would flood the audit log.
+            with LOCK:
+                record = record_orchestrator_heartbeat(
+                    data.get("timestamp"), data.get("status", ""))
+                save_json("orchestrator.json", record)
+                return self.send_json({"ok": True,
+                                       **orchestrator_status(record)})
 
         if u.path == "/api/tasks/log":
             # Worker output streaming: {id, text}. Appends to the
