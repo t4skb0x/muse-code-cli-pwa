@@ -128,7 +128,8 @@ def heartbeat_forever(task_id, stop):
     """POST a heartbeat every HEARTBEAT_INTERVAL until stop is set."""
     while not stop.wait(HEARTBEAT_INTERVAL):
         try:
-            api("/api/tasks/heartbeat", {"id": task_id, "worker": WORKER_ID})
+            api("/api/tasks/heartbeat", {"id": task_id, "worker": WORKER_ID,
+                                         "pid": os.getpid()})
         except Exception as e:
             print("heartbeat error:", e, flush=True)
 
@@ -159,11 +160,81 @@ def timed_out(task_id, elapsed, partial):
         "id": task_id,
         "status": "failed",
         "result": (note + (partial or ""))[-8000:],
+        "exit_code": 124,
     })
 
 
+def post_log(task_id, text):
+    """Stream one output chunk to the server's per-task log (best effort)."""
+    try:
+        api("/api/tasks/log", {"id": task_id, "text": str(text or "")})
+    except Exception as e:
+        print("log error:", e, flush=True)
+
+
+def report_death(task_id, exit_code, tail=""):
+    """Tell the server the worker process died without completing the task."""
+    try:
+        return api("/api/tasks/death", {
+            "id": task_id,
+            "exit_code": exit_code,
+            "tail": str(tail or "")[-2000:],
+        })
+    except Exception as e:
+        print("death-report error:", e, flush=True)
+        return None
+
+
+def run_streaming(cmd, cwd, task_id, timeout=EXEC_TIMEOUT):
+    """Run a command, streaming combined output to the per-task log.
+
+    Returns (returncode, full output). Raises subprocess.TimeoutExpired
+    (with partial output) when the deadline hits, like sh() does.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1)
+    out, buf, chunk_lines = [], [], 0
+    deadline = time.time() + timeout
+    try:
+        while True:
+            if time.time() > deadline:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise subprocess.TimeoutExpired(cmd, timeout,
+                                                output="".join(out))
+            line = proc.stdout.readline()
+            if line:
+                out.append(line)
+                buf.append(line)
+                chunk_lines += 1
+                if chunk_lines >= 20 or len("".join(buf)) >= 4000:
+                    post_log(task_id, "".join(buf))
+                    buf, chunk_lines = [], 0
+            elif proc.poll() is not None:
+                rest = proc.stdout.read() or ""
+                if rest:
+                    out.append(rest)
+                    buf.append(rest)
+                break
+            else:
+                time.sleep(0.05)
+    finally:
+        if buf:
+            post_log(task_id, "".join(buf))
+    return proc.returncode, "".join(out)
+
+
 def run_task(t):
-    """Run one claimed task headless and report the result to the server."""
+    """Run one claimed task headless and report the result to the server.
+
+    Any unexpected escape (bug, lost server, killed child supervisor)
+    posts a death report, so the task records WHY it died instead of
+    going silent.
+    """
     stop = threading.Event()
     hb = threading.Thread(target=heartbeat_forever, args=(t["id"], stop),
                           daemon=True)
@@ -171,6 +242,9 @@ def run_task(t):
     try:
         progress(t["id"], f"worker {WORKER_ID} started ({t['autonomy']} mode)")
         return _run_task_inner(t)
+    except Exception as e:
+        return report_death(t["id"], getattr(e, "errno", 1) or 1,
+                            f"{type(e).__name__}: {e}")
     finally:
         stop.set()
         hb.join(timeout=5)
@@ -193,25 +267,36 @@ def _run_task_inner(t):
            "--reasoning-effort", t["effort"],
            "--approval-mode", "never",
            "--trust-workspace", prompt]
+    # Command preview recorded on the claim so the orchestrator can see
+    # exactly what the worker process was asked to run.
+    t["_cmd_preview"] = " ".join(cmd[:6]) + " <prompt>"
 
     if t["autonomy"] == "approve":
         return _run_approve_mode(t, repo, cmd)
 
     # auto mode: run directly in the repo, post results when done.
     try:
-        code, out = sh(cmd, repo)
+        code, out = run_streaming(cmd, repo, t["id"])
     except subprocess.TimeoutExpired as e:
         return timed_out(t["id"], EXEC_TIMEOUT, _partial_output(e))
+    except Exception as e:
+        # The worker itself broke before completing the task: record the
+        # death (exit code, last output) instead of going silent.
+        return report_death(t["id"], getattr(e, "errno", 1) or 1,
+                            f"{type(e).__name__}: {e}")
     if (repo / ".git").exists():
         _, stat = sh(["git", "diff", "--stat"], repo, 60)
     else:
         stat = ""
     progress(t["id"], f"finished with exit code {code}")
+    # Non-zero exits complete normally; the server records the exit code
+    # (and a death reason) on the task from this update.
     return api("/api/tasks/update", {
         "id": t["id"],
         "status": "done" if code == 0 else "failed",
         "result": out[-8000:],
         "diff": stat,
+        "exit_code": code,
     })
 
 
@@ -230,9 +315,12 @@ def _run_approve_mode(t, repo, cmd):
 
     progress(t["id"], f"running in isolated worktree {wt.name}")
     try:
-        code, out = sh(cmd, wt)
+        code, out = run_streaming(cmd, wt, t["id"])
     except subprocess.TimeoutExpired as e:
         return timed_out(t["id"], EXEC_TIMEOUT, _partial_output(e))
+    except Exception as e:
+        return report_death(t["id"], getattr(e, "errno", 1) or 1,
+                            f"{type(e).__name__}: {e}")
 
     # Capture the diff as a patch file for the approve/reject step.
     sh(["git", "add", "-A"], wt, 60)
@@ -248,6 +336,7 @@ def _run_approve_mode(t, repo, cmd):
         "status": "awaiting_approval",
         "result": out[-8000:],
         "diff": stat,
+        "exit_code": code,
     })
 
 
@@ -260,7 +349,9 @@ def main():
     print(f"Muse Code CLI PWA worker polling as {WORKER_ID}", flush=True)
     while True:
         try:
-            t = api("/api/tasks/claim", {"worker": WORKER_ID})["task"]
+            t = api("/api/tasks/claim", {"worker": WORKER_ID,
+                                         "pid": os.getpid(),
+                                         "cmd": f"{MUSE_BIN} exec"})["task"]
             if t:
                 run_task(t)
             else:
