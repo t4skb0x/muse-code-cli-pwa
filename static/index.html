@@ -24,8 +24,13 @@
 <label>Model <input id="taskModel" placeholder="model id (e.g. muse-spark-1.3)"></label>
 <label>Effort <select id="taskEffort"><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label>
 <label>Mode <select id="taskAuto"><option value="auto" selected>Full auto (runs, posts result)</option><option value="approve">Approve (worktree, hold diff)</option></select></label>
+<label>Priority <select id="taskPriority"><option value="normal" selected>normal</option><option value="high">high</option><option value="low">low</option></select></label>
 <label>Goal <select id="taskGoal"><option value="">(none)</option></select></label>
-<button id="taskBtn">Start task</button><div id="taskList"></div></section>
+<button id="taskBtn">Start task</button>
+<h3>Workers</h3><div id="workerPanel"><p>Not loaded.</p></div>
+<h3>Tasks <select id="taskFilter"><option value="">all</option><option value="queued">queued</option><option value="running">running</option><option value="awaiting_approval">awaiting approval</option><option value="done">done</option><option value="failed">failed</option><option value="rejected">rejected</option></select></h3>
+<div id="taskList"></div>
+<div id="taskPages"><button id="taskPrev">← Newer</button><span id="taskPageInfo"></span><button id="taskNext">Older →</button></div></section>
 <section id="tab-files" hidden><div id="crumbs"></div><ul id="fileList"></ul><div id="viewer" hidden><h3 id="vName"></h3><textarea id="vBody" spellcheck="false"></textarea><button id="vSave">Save (backup kept)</button><button id="vClose">Close</button></div></section>
 <section id="tab-term" hidden><pre id="termOut">cwd = workspace root. 30s timeout, every command audited.</pre><form id="termForm"><input id="termIn" placeholder="$ command…" autocomplete="off" autocapitalize="off"><button>Run</button></form></section>
 <section id="tab-diff" hidden><button id="diffBtn">Refresh git status + diff</button><pre id="diffOut">Not loaded.</pre></section>
