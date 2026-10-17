@@ -114,6 +114,8 @@ ORCH_ROOT = BASE
 ORCH_PATHS = (
     "/api/me", "/api/chat",
     "/api/tasks", "/api/tasks/claim", "/api/tasks/update",
+    "/api/tasks/heartbeat", "/api/tasks/progress", "/api/tasks/retry",
+    "/api/workers",
     "/api/goals", "/api/goals/update",
     "/api/files", "/api/file",
 )
@@ -194,6 +196,231 @@ def save_json(name: str, obj) -> None:
 def new_id() -> str:
     """Unique id for tasks and goals: <epoch>-<random hex>."""
     return str(int(time.time())) + "-" + secrets.token_hex(3)
+
+
+# ---------------------------------------------------------------------------
+# Task orchestration helpers (pure list ops — unit-tested in tests/)
+# ---------------------------------------------------------------------------
+
+TASK_MAX_RUNTIME = {"low": 1800, "medium": 7200, "high": 14400}  # seconds
+HEARTBEAT_STALE = 300  # a heartbeat newer than this means the worker is alive
+SWEEP_INTERVAL = int(os.environ.get("MUSE_PWA_SWEEP_INTERVAL", "60"))
+TERMINAL_STATUSES = ("done", "failed", "rejected")
+PRIORITY_RANK = {"high": 0, "normal": 1, "low": 2}
+
+
+def task_max_runtime(effort) -> int:
+    """Max run-seconds for an effort level (unknown efforts get 'high')."""
+    return TASK_MAX_RUNTIME.get(str(effort or "high").lower(), 14400)
+
+
+def normalize_priority(value) -> str:
+    """Coerce a priority to high/normal/low (default: normal)."""
+    v = str(value or "normal").lower()
+    return v if v in PRIORITY_RANK else "normal"
+
+
+def sweep_timeouts(tasks, now=None) -> bool:
+    """Fail 'running' tasks past their effort lease. True if changed.
+
+    A task with a fresh worker heartbeat is alive by definition, so the
+    sweep skips it. Partial output already posted is preserved: the
+    timeout note is appended, never replacing it.
+    """
+    now = int(now if now is not None else time.time())
+    changed = False
+    for t in tasks:
+        if t.get("status") != "running":
+            continue
+        try:
+            sa = int(t.get("started_at"))
+            fresh_lease = False
+        except (TypeError, ValueError):
+            try:  # legacy task: backfill from display ts (local wall time)
+                sa = int(time.mktime(time.strptime(
+                    str(t.get("ts", ""))[:19], "%Y-%m-%dT%H:%M:%S")))
+                fresh_lease = False
+            except (ValueError, OverflowError):
+                sa = now  # unparseable ts: grant a full lease, don't fail now
+                fresh_lease = True
+            t["started_at"] = sa
+            changed = True
+            if fresh_lease:
+                continue
+        try:
+            hb = int(t.get("heartbeat_at") or 0)
+        except (TypeError, ValueError):
+            hb = 0
+        if hb and now - hb < HEARTBEAT_STALE:
+            continue  # worker is alive; its own timeout will finish the task
+        limit = task_max_runtime(t.get("effort"))
+        if now - sa > limit:
+            note = (f"Timeout: worker produced no result after "
+                    f"{limit / 3600:g}h (effort={t.get('effort')}). "
+                    f"Likely died silently. Safe to re-dispatch as fresh task.")
+            prev = (t.get("result") or "").strip()
+            t["result"] = (((prev + "\n\n") if prev else "") + note)[:20000]
+            t["status"] = "failed"
+            t["finished_at"] = now
+            changed = True
+    return changed
+
+
+def sweep_forever() -> None:
+    """Background timeout sweep (daemon thread): no request path runs it."""
+    while True:
+        time.sleep(SWEEP_INTERVAL)
+        try:
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                if sweep_timeouts(tasks):
+                    save_json("tasks.json", tasks)
+        except Exception:
+            pass  # never take down the server over a sweep
+
+
+def enrich_task(t, now=None) -> dict:
+    """Copy of a task plus elapsed_seconds and timeout_at (epoch or None)."""
+    now = int(now if now is not None else time.time())
+    out = dict(t)
+    try:
+        sa = int(t.get("started_at"))
+    except (TypeError, ValueError):
+        sa = None
+    try:
+        fa = int(t.get("finished_at"))
+    except (TypeError, ValueError):
+        fa = None
+    if t.get("status") == "running" and sa:
+        out["elapsed_seconds"] = max(0, now - sa)
+        out["timeout_at"] = sa + task_max_runtime(t.get("effort"))
+    else:
+        out["elapsed_seconds"] = max(0, (fa - sa) if (sa and fa) else 0)
+        out["timeout_at"] = None
+    return out
+
+
+def claim_task(tasks, worker="", now=None):
+    """Claim the highest-priority queued task (FIFO within a priority)."""
+    now = int(now if now is not None else time.time())
+    ranked = sorted(
+        (t for t in tasks if t.get("status") == "queued"),
+        key=lambda t: (PRIORITY_RANK.get(
+            str(t.get("priority") or "normal").lower(), 1),
+            str(t.get("ts", "")), str(t.get("id", ""))),
+    )
+    if not ranked:
+        return None
+    t = ranked[0]
+    t["status"] = "running"
+    t["started_at"] = now
+    t["finished_at"] = None
+    t["worker"] = str(worker or "")[:80]
+    t["heartbeat_at"] = None
+    return t
+
+
+def heartbeat_task(tasks, task_id, worker="", now=None):
+    """Record a worker heartbeat. Returns the task, or None if missing."""
+    now = int(now if now is not None else time.time())
+    for t in tasks:
+        if t["id"] == task_id:
+            t["heartbeat_at"] = now
+            if worker:
+                t["worker"] = str(worker)[:80]
+            return t
+    return None
+
+
+def add_progress(tasks, task_id, message, now=None):
+    """Append a progress note (also a heartbeat). Returns (task, error)."""
+    now = int(now if now is not None else time.time())
+    msg = str(message or "").strip()
+    if not msg:
+        return None, "empty message"
+    for t in tasks:
+        if t["id"] == task_id:
+            if t.get("status") not in ("queued", "running"):
+                return None, "task not active"
+            log = t.get("progress") or []
+            log.append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "message": msg[:500]})
+            t["progress"] = log[-50:]
+            t["heartbeat_at"] = now
+            return t, None
+    return None, "no task"
+
+
+def retry_task(tasks, task_id, now=None):
+    """Re-dispatch a failed task with the same text. Returns (task, error)."""
+    now = int(now if now is not None else time.time())
+    for t in tasks:
+        if t["id"] == task_id:
+            if t.get("status") != "failed":
+                return None, "only failed tasks can be retried"
+            nt = {
+                "id": new_id(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "started_at": now,
+                "text": t.get("text", ""),
+                "repo": t.get("repo", "muse-pwa"),
+                "model": t.get("model", "muse-spark-1.3-contributor"),
+                "effort": t.get("effort", "high"),
+                "autonomy": t.get("autonomy", "auto"),
+                "goal_id": t.get("goal_id", ""),
+                "priority": normalize_priority(t.get("priority")),
+                "status": "queued", "result": "", "diff": "", "wt": "",
+                "worker": "", "heartbeat_at": None, "progress": [],
+                "retried_from": t["id"],
+            }
+            tasks.append(nt)
+            return nt, None
+    return None, "no task"
+
+
+def summarize_workers(tasks) -> list:
+    """Connected workers: last heartbeat plus current running task, if any."""
+    workers: dict = {}
+    for t in tasks:
+        w = (t.get("worker") or "").strip()
+        if not w:
+            continue
+        e = workers.setdefault(w, {"worker": w, "last_heartbeat": None,
+                                   "current_task": None,
+                                   "current_task_text": ""})
+        try:
+            hb = int(t.get("heartbeat_at") or 0) or None
+        except (TypeError, ValueError):
+            hb = None
+        if hb and (not e["last_heartbeat"] or hb > e["last_heartbeat"]):
+            e["last_heartbeat"] = hb
+        if t.get("status") == "running":
+            e["current_task"] = t["id"]
+            e["current_task_text"] = str(t.get("text", ""))[:120]
+    return sorted(workers.values(), key=lambda e: e["worker"])
+
+
+def filter_tasks(tasks, status="") -> list:
+    """Keep only tasks with the given status ("" keeps everything)."""
+    s = str(status or "").strip().lower()
+    if not s:
+        return list(tasks)
+    return [t for t in tasks if str(t.get("status", "")).lower() == s]
+
+
+def paginate(items, page=1, per_page=20):
+    """Slice newest-first items into a page. Returns (items, page, pp, total)."""
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        per_page = min(100, max(1, int(per_page)))
+    except (TypeError, ValueError):
+        per_page = 20
+    total = len(items)
+    start = (page - 1) * per_page
+    return items[start:start + per_page], page, per_page, total
 
 
 def git(args: list, cwd: Path) -> str:
@@ -300,9 +527,26 @@ class H(BaseHTTPRequestHandler):
                                    "content": p.read_text(errors="replace")})
 
         if path == "/api/tasks":
+            # ?status=queued|running|done|… filters; ?page=&per_page= paginates.
+            # Timeout sweep runs on a background interval, not per request.
             with LOCK:
                 tasks = load_json("tasks.json", [])
-            return self.send_json({"tasks": list(reversed(tasks))[:100]})
+            now = int(time.time())
+            visible = filter_tasks(tasks, q.get("status", [""])[0])
+            ordered = list(reversed(visible))
+            page_items, page, per_page, total = paginate(
+                ordered, q.get("page", ["1"])[0],
+                q.get("per_page", ["20"])[0])
+            return self.send_json({
+                "tasks": [enrich_task(t, now) for t in page_items],
+                "page": page, "per_page": per_page, "total": total,
+            })
+
+        if path == "/api/workers":
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+            return self.send_json({"workers": summarize_workers(tasks),
+                                   "now": int(time.time())})
 
         if path == "/api/goals":
             with LOCK:
@@ -411,34 +655,90 @@ class H(BaseHTTPRequestHandler):
                 "autonomy": ("approve" if data.get("autonomy") == "approve"
                              else "auto"),
                 "goal_id": str(data.get("goal_id", ""))[:40],
+                "priority": normalize_priority(data.get("priority")),
                 "status": "queued", "result": "", "diff": "", "wt": "",
+                "worker": "", "heartbeat_at": None, "progress": [],
             }
             with LOCK:
                 tasks = load_json("tasks.json", [])
                 tasks.append(task)
                 save_json("tasks.json", tasks)
             audit("task-create", task["id"])
-            return self.send_json({"ok": True, "task": task})
+            return self.send_json({"ok": True, "task": enrich_task(task)})
 
         if u.path == "/api/tasks/claim":
-            # Worker picks up the oldest queued task.
+            # Worker picks up the highest-priority queued task (FIFO inside
+            # a priority). Records which worker claimed it (task.worker).
             with LOCK:
                 tasks = load_json("tasks.json", [])
-                for t in tasks:
-                    if t["status"] == "queued":
-                        t["status"] = "running"
-                        save_json("tasks.json", tasks)
-                        return self.send_json({"ok": True, "task": t})
-            return self.send_json({"ok": True, "task": None})
+                t = claim_task(tasks, data.get("worker", ""))
+                if t is None:
+                    return self.send_json({"ok": True, "task": None})
+                save_json("tasks.json", tasks)
+                return self.send_json({"ok": True, "task": enrich_task(t)})
+
+        if u.path == "/api/tasks/heartbeat":
+            # Worker sign of life while running: {id, worker?}.
+            tid = str(data.get("id", ""))
+            if not tid:
+                return self.send_json({"error": "missing id"}, 400)
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                t = heartbeat_task(tasks, tid, data.get("worker", ""))
+                if t is None:
+                    return self.send_json({"error": "no task"}, 404)
+                save_json("tasks.json", tasks)
+                return self.send_json({"ok": True,
+                                       "heartbeat_at": t["heartbeat_at"]})
+
+        if u.path == "/api/tasks/progress":
+            # Incremental progress on a long task: {id, message}.
+            tid = str(data.get("id", ""))
+            if not tid:
+                return self.send_json({"error": "missing id"}, 400)
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                t, err = add_progress(tasks, tid, data.get("message", ""))
+                if err == "no task":
+                    return self.send_json({"error": "no task"}, 404)
+                if err:
+                    return self.send_json({"error": err}, 400)
+                save_json("tasks.json", tasks)
+                return self.send_json({"ok": True,
+                                       "heartbeat_at": t["heartbeat_at"]})
+
+        if u.path == "/api/tasks/retry":
+            # Re-dispatch a failed task with the same text: {id}.
+            tid = str(data.get("id", ""))
+            if not tid:
+                return self.send_json({"error": "missing id"}, 400)
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                nt, err = retry_task(tasks, tid)
+                if err == "no task":
+                    return self.send_json({"error": "no task"}, 404)
+                if err:
+                    return self.send_json({"error": err}, 400)
+                save_json("tasks.json", tasks)
+            audit("/api/tasks/retry", tid)
+            return self.send_json({"ok": True, "task": enrich_task(nt)})
 
         if u.path == "/api/tasks/update":
             with LOCK:
                 tasks = load_json("tasks.json", [])
                 for t in tasks:
                     if t["id"] == str(data.get("id", "")):
-                        for k in ("status", "result", "diff", "wt"):
+                        for k in ("status", "result", "diff", "wt", "worker"):
                             if k in data:
                                 t[k] = str(data[k])[:20000]
+                        if "heartbeat_at" in data:
+                            try:
+                                t["heartbeat_at"] = int(data["heartbeat_at"])
+                            except (TypeError, ValueError):
+                                pass
+                        if t.get("status") in (TERMINAL_STATUSES
+                                               + ("awaiting_approval",)):
+                            t["finished_at"] = int(time.time())
                         save_json("tasks.json", tasks)
                         return self.send_json({"ok": True})
             return self.send_json({"error": "no task"}, 404)
@@ -461,6 +761,7 @@ class H(BaseHTTPRequestHandler):
                     task["status"] = "rejected"
                 if task.get("wt"):
                     git(["worktree", "remove", "--force", task["wt"]], repo)
+                task["finished_at"] = int(time.time())
                 save_json("tasks.json", tasks)
             audit(u.path, str(data.get("id", "")))
             return self.send_json({"ok": True})
@@ -526,6 +827,7 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     DATA.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=sweep_forever, daemon=True).start()
     print(f"Muse Code CLI PWA on http://127.0.0.1:{PORT} "
           f"workspace={WORKSPACE}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
