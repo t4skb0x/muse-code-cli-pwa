@@ -19,6 +19,11 @@ Configuration (environment variables):
                          data/orchestrator-token.txt, else data/token.txt)
     MUSE_CLI_BIN         Muse Code CLI binary (default: "muse").
                          Override if `muse` is not on PATH.
+    WORKER_ID            Identity reported on claim/heartbeat
+                         (default: the machine hostname).
+    MUSE_PWA_HEARTBEAT_INTERVAL
+                         Seconds between heartbeats while a task runs
+                         (default: 60).
 
 Prerequisite: the Muse Code CLI must support `muse exec`. Verify with:
     muse exec --help
@@ -31,7 +36,9 @@ Released as open source — see LICENSE.
 
 import json
 import os
+import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -53,6 +60,16 @@ PORT = os.environ.get("MUSE_PWA_PORT", "3091")
 API = f"http://127.0.0.1:{PORT}"
 
 EXEC_TIMEOUT = 900  # max seconds per headless task run (15 min)
+
+# Worker identity, reported on claim/heartbeat so the phone UI can show
+# which machine runs each task. Override with WORKER_ID when several
+# workers share a hostname (e.g. multiple systemd instances).
+WORKER_ID = os.environ.get("WORKER_ID", "").strip() or socket.gethostname()
+
+# Seconds between heartbeat POSTs while a task runs (also refreshable via
+# MUSE_PWA_HEARTBEAT_INTERVAL). The server treats a task with a fresh
+# heartbeat as alive and skips it in the timeout sweep.
+HEARTBEAT_INTERVAL = int(os.environ.get("MUSE_PWA_HEARTBEAT_INTERVAL", "60"))
 
 
 def _load_token() -> str:
@@ -107,8 +124,60 @@ def _goal_context(task) -> str:
 # Task execution
 # ---------------------------------------------------------------------------
 
+def heartbeat_forever(task_id, stop):
+    """POST a heartbeat every HEARTBEAT_INTERVAL until stop is set."""
+    while not stop.wait(HEARTBEAT_INTERVAL):
+        try:
+            api("/api/tasks/heartbeat", {"id": task_id, "worker": WORKER_ID})
+        except Exception as e:
+            print("heartbeat error:", e, flush=True)
+
+
+def progress(task_id, message):
+    """Report incremental progress (also refreshes the heartbeat)."""
+    try:
+        api("/api/tasks/progress", {"id": task_id, "message": message})
+    except Exception as e:
+        print("progress error:", e, flush=True)
+
+
+def _partial_output(exc) -> str:
+    """Best-effort decode of TimeoutExpired output (bytes on timeout)."""
+    out = []
+    for chunk in (getattr(exc, "stdout", None), getattr(exc, "stderr", None)):
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode(errors="replace")
+        out.append(chunk or "")
+    return "".join(out)
+
+
+def timed_out(task_id, elapsed, partial):
+    """Report a task timeout, preserving any partial output produced."""
+    note = (f"Timeout after {elapsed}s: worker produced no final result. "
+            f"Partial output preserved below.\n")
+    return api("/api/tasks/update", {
+        "id": task_id,
+        "status": "failed",
+        "result": (note + (partial or ""))[-8000:],
+    })
+
+
 def run_task(t):
     """Run one claimed task headless and report the result to the server."""
+    stop = threading.Event()
+    hb = threading.Thread(target=heartbeat_forever, args=(t["id"], stop),
+                          daemon=True)
+    hb.start()
+    try:
+        progress(t["id"], f"worker {WORKER_ID} started ({t['autonomy']} mode)")
+        return _run_task_inner(t)
+    finally:
+        stop.set()
+        hb.join(timeout=5)
+
+
+def _run_task_inner(t):
+    """Task body: runs under the heartbeat thread started by run_task."""
     repo = (WORKSPACE / t["repo"]).resolve()
 
     prompt = (
@@ -129,11 +198,15 @@ def run_task(t):
         return _run_approve_mode(t, repo, cmd)
 
     # auto mode: run directly in the repo, post results when done.
-    code, out = sh(cmd, repo)
+    try:
+        code, out = sh(cmd, repo)
+    except subprocess.TimeoutExpired as e:
+        return timed_out(t["id"], EXEC_TIMEOUT, _partial_output(e))
     if (repo / ".git").exists():
         _, stat = sh(["git", "diff", "--stat"], repo, 60)
     else:
         stat = ""
+    progress(t["id"], f"finished with exit code {code}")
     return api("/api/tasks/update", {
         "id": t["id"],
         "status": "done" if code == 0 else "failed",
@@ -155,7 +228,11 @@ def _run_approve_mode(t, repo, cmd):
 
     api("/api/tasks/update", {"id": t["id"], "wt": str(wt)})
 
-    code, out = sh(cmd, wt)
+    progress(t["id"], f"running in isolated worktree {wt.name}")
+    try:
+        code, out = sh(cmd, wt)
+    except subprocess.TimeoutExpired as e:
+        return timed_out(t["id"], EXEC_TIMEOUT, _partial_output(e))
 
     # Capture the diff as a patch file for the approve/reject step.
     sh(["git", "add", "-A"], wt, 60)
@@ -178,14 +255,20 @@ def _run_approve_mode(t, repo, cmd):
 # Main loop
 # ---------------------------------------------------------------------------
 
-print("Muse Code CLI PWA worker polling", flush=True)
-while True:
-    try:
-        t = api("/api/tasks/claim", {})["task"]
-        if t:
-            run_task(t)
-        else:
-            time.sleep(5)
-    except Exception as e:
-        print("worker error:", e, flush=True)
-        time.sleep(10)
+def main():
+    """Poll for queued tasks and run them (import-safe: see tests/)."""
+    print(f"Muse Code CLI PWA worker polling as {WORKER_ID}", flush=True)
+    while True:
+        try:
+            t = api("/api/tasks/claim", {"worker": WORKER_ID})["task"]
+            if t:
+                run_task(t)
+            else:
+                time.sleep(5)
+        except Exception as e:
+            print("worker error:", e, flush=True)
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
