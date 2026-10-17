@@ -16,7 +16,7 @@ $("#logout").onclick = async () => { await api("/api/logout", { method: "POST" }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.remove("on")); b.classList.add("on");
   ["chat", "tasks", "files", "term", "diff"].forEach(t => $("#tab-" + t).hidden = t !== b.dataset.tab);
-  if (b.dataset.tab === "tasks") { loadGoals(); loadTasks(); }
+  if (b.dataset.tab === "tasks") { loadGoals(); loadTasks(); loadMonitors(); }
 });
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 async function loadChat() {
@@ -113,9 +113,63 @@ async function taskRetry(id) { const d = await api("/api/tasks/retry", { method:
 async function loadWorkers() {
   try {
     const d = await api("/api/workers");
-    $("#workerPanel").innerHTML = d.workers.map(w => `<div class="msg"><small>@${esc(w.worker)} · heartbeat ${fmtAgo(w.last_heartbeat, d.now)}</small>${w.current_task ? `running: ${esc(w.current_task_text)}` : "idle"}</div>`).join("") || "<p>No workers seen yet.</p>";
+    $("#workerPanel").innerHTML = d.workers.map(w => {
+      const proc = w.pid ? (w.alive === true ? ` · pid ${w.pid} alive` : w.alive === false ? ` · pid ${w.pid} DEAD` : ` · pid ${w.pid}`) : "";
+      const dead = w.death_reason ? ` · DIED` : "";
+      return `<div class="msg"><small>@${esc(w.worker)} · heartbeat ${fmtAgo(w.last_heartbeat, d.now)}${proc}${dead}</small>${w.current_task ? `running: ${esc(w.current_task_text)}` : "idle"} <button data-wd="${esc(w.worker)}">detail</button></div>`;
+    }).join("") || "<p>No workers seen yet.</p>";
+    document.querySelectorAll("[data-wd]").forEach(b => b.onclick = () => loadWorkerDetail(b.dataset.wd));
   } catch (e) {}
 }
+let workerDetailId = null;
+async function loadWorkerDetail(id) {
+  workerDetailId = id;
+  const st = await api("/api/workers/" + encodeURIComponent(id) + "/status");
+  if (st.error) { $("#workerDetail").innerHTML = `<p>${esc(st.error)}</p>`; return; }
+  const procLine = st.pid
+    ? (st.alive === true ? `pid ${st.pid} — ALIVE` : st.alive === false ? `pid ${st.pid} — NOT RUNNING` : `pid ${st.pid} — unknown host`)
+    : "pid unknown (worker claimed without process tracking)";
+  const hbLine = st.last_heartbeat
+    ? `last heartbeat ${fmtAgo(st.last_heartbeat, st.now)}${st.heartbeat_stale ? " (STALE)" : ""}`
+    : "no heartbeat yet";
+  let logHtml = "";
+  if (st.current_task) {
+    try {
+      const log = await api("/api/tasks/" + encodeURIComponent(st.current_task) + "/log?lines=30");
+      logHtml = `<h4>Recent output — task ${esc(st.current_task)}</h4><pre>${esc((log.lines || []).join("\n")) || "(no output captured)"}</pre>`;
+    } catch (e) { logHtml = "<p>Log unavailable.</p>"; }
+  }
+  $("#workerDetail").innerHTML = `<div class="msg"><small>WORKER DETAIL · @${esc(st.worker)}</small><br>`
+    + `<small>process: ${esc(procLine)}</small><br>`
+    + (st.cmd ? `<small>cmd: ${esc(st.cmd)}</small><br>` : "")
+    + `<small>${esc(hbLine)}</small><br>`
+    + `<small>current task: ${st.current_task ? esc(st.current_task) + " — " + esc(st.current_task_text) : "none"}</small>`
+    + (st.death_reason ? `<br><small>DEATH: ${esc(st.death_reason)}</small>` : "")
+    + `<br><button id="wdClose">Close</button></div>` + logHtml;
+  $("#wdClose").onclick = () => { $("#workerDetail").innerHTML = ""; workerDetailId = null; };
+}
+function fmtWhen(ts, now) {
+  if (!ts) return "never";
+  return fmtAgo(ts, now) + " (" + new Date(ts * 1000).toLocaleTimeString() + ")";
+}
+function fmtNext(ts) {
+  if (!ts) return "—";
+  const s = Math.max(0, ts - Math.floor(Date.now() / 1000));
+  return "in " + fmtDur(s) + " (" + new Date(ts * 1000).toLocaleTimeString() + ")";
+}
+async function loadMonitors() {
+  try {
+    const d = await api("/api/monitors");
+    $("#monList").innerHTML = d.monitors.map(m => `<div class="msg"><small>MONITOR · ${esc(m.type)} · every ${m.interval}s · active</small>${esc(m.name)}${m.target ? ` · target ${esc(m.target)}` : " · all tasks"}<br><small>last check: ${fmtWhen(m.last_check, Math.floor(Date.now() / 1000))} · next: ${fmtNext(m.next_check)} · checks: ${m.check_count || 0}</small>${m.last_result ? `<div class="prog">▸ ${esc(m.last_result)}</div>` : ""} <button data-mdel="${esc(m.name)}">Remove</button></div>`).join("") || "<p>No monitors yet — they stay on until you remove them.</p>";
+    document.querySelectorAll("[data-mdel]").forEach(b => b.onclick = async () => { if (!confirm("Remove monitor " + b.dataset.mdel + "? It will stop checking.")) return; await fetch("/api/monitors/" + encodeURIComponent(b.dataset.mdel), { method: "DELETE" }); loadMonitors(); });
+  } catch (e) {}
+}
+$("#monForm").onsubmit = async e => {
+  e.preventDefault();
+  const d = await api("/api/monitors", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: $("#monName").value, type: $("#monType").value, interval: +$("#monInterval").value || 60, target: $("#monTarget").value }) });
+  if (d.error) return alert(d.error);
+  $("#monName").value = ""; $("#monTarget").value = ""; loadMonitors();
+};
 // Tick live running durations every second without a server round-trip.
 setInterval(() => {
   const nowS = Math.floor(Date.now() / 1000);
@@ -124,6 +178,6 @@ setInterval(() => {
     el.textContent = "elapsed " + fmtDur(s);
   });
 }, 1000);
-setInterval(() => { if (!$("#tab-tasks").hidden && !$("#app").hidden) { loadTasks(); loadGoals(); } }, 5000);
+setInterval(() => { if (!$("#tab-tasks").hidden && !$("#app").hidden) { loadTasks(); loadGoals(); loadMonitors(); } }, 5000);
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
 api("/api/me").then(showApp).catch(showLogin);
