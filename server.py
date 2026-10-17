@@ -115,10 +115,23 @@ ORCH_PATHS = (
     "/api/me", "/api/chat",
     "/api/tasks", "/api/tasks/claim", "/api/tasks/update",
     "/api/tasks/heartbeat", "/api/tasks/progress", "/api/tasks/retry",
+    "/api/tasks/log", "/api/tasks/death",
     "/api/workers",
     "/api/goals", "/api/goals/update",
     "/api/files", "/api/file",
 )
+# Dynamic orchestrator-readable paths (prefix match in H.authed):
+#   GET /api/tasks/<id>/log  (tail worker output)
+#   GET /api/workers/<id>/status  (process + heartbeat + current task)
+# /api/tasks/approve and /api/tasks/reject look like they match the
+# prefix but stay operator-only (explicit role check in the handler).
+ORCH_PREFIXES = ("/api/tasks/", "/api/workers/")
+ORCH_PREFIX_DENY = ("/api/tasks/approve", "/api/tasks/reject")
+
+# Worker observability limits
+LOGS_DIRNAME = "logs"     # per-task worker output lives in data/logs/<id>.log
+LOG_MAX_BYTES = 200_000   # per-task log cap (oldest output trimmed)
+LOG_TAIL_MAX = 1000       # max lines served per tail request
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +268,20 @@ def sweep_timeouts(tasks, now=None) -> bool:
             continue  # worker is alive; its own timeout will finish the task
         limit = task_max_runtime(t.get("effort"))
         if now - sa > limit:
+            try:
+                pid = int(t.get("worker_pid")) \
+                    if t.get("worker_pid") is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            if pid and not is_process_alive(pid):
+                # Death detection: the worker process is gone and never
+                # completed the task — record exit state, don't just guess.
+                tail = read_task_log(t.get("id", ""), 20)["lines"]
+                record_worker_death(
+                    t, t.get("exit_code"),
+                    "\n".join(tail[-20:]), now)
+                changed = True
+                continue
             note = (f"Timeout: worker produced no result after "
                     f"{limit / 3600:g}h (effort={t.get('effort')}). "
                     f"Likely died silently. Safe to re-dispatch as fresh task.")
@@ -300,8 +327,13 @@ def enrich_task(t, now=None) -> dict:
     return out
 
 
-def claim_task(tasks, worker="", now=None):
-    """Claim the highest-priority queued task (FIFO within a priority)."""
+def claim_task(tasks, worker="", now=None, pid=None, cmd=""):
+    """Claim the highest-priority queued task (FIFO within a priority).
+
+    Records worker process tracking: PID, claim (start) time, and the
+    command the worker is about to run. pid/cmd are optional so old
+    workers that only send a name keep working.
+    """
     now = int(now if now is not None else time.time())
     ranked = sorted(
         (t for t in tasks if t.get("status") == "queued"),
@@ -317,10 +349,19 @@ def claim_task(tasks, worker="", now=None):
     t["finished_at"] = None
     t["worker"] = str(worker or "")[:80]
     t["heartbeat_at"] = None
+    try:
+        t["worker_pid"] = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        t["worker_pid"] = None
+    t["worker_cmd"] = str(cmd or "")[:500]
+    t["worker_started_at"] = now
+    t["exit_code"] = None
+    t["death_at"] = None
+    t["death_reason"] = ""
     return t
 
 
-def heartbeat_task(tasks, task_id, worker="", now=None):
+def heartbeat_task(tasks, task_id, worker="", now=None, pid=None):
     """Record a worker heartbeat. Returns the task, or None if missing."""
     now = int(now if now is not None else time.time())
     for t in tasks:
@@ -328,6 +369,11 @@ def heartbeat_task(tasks, task_id, worker="", now=None):
             t["heartbeat_at"] = now
             if worker:
                 t["worker"] = str(worker)[:80]
+            if pid is not None:
+                try:
+                    t["worker_pid"] = int(pid)
+                except (TypeError, ValueError):
+                    pass
             return t
     return None
 
@@ -371,6 +417,9 @@ def retry_task(tasks, task_id, now=None):
                 "priority": normalize_priority(t.get("priority")),
                 "status": "queued", "result": "", "diff": "", "wt": "",
                 "worker": "", "heartbeat_at": None, "progress": [],
+                "worker_pid": None, "worker_cmd": "",
+                "worker_started_at": None, "exit_code": None,
+                "death_at": None, "death_reason": "",
                 "retried_from": t["id"],
             }
             tasks.append(nt)
@@ -379,7 +428,11 @@ def retry_task(tasks, task_id, now=None):
 
 
 def summarize_workers(tasks) -> list:
-    """Connected workers: last heartbeat plus current running task, if any."""
+    """Connected workers: last heartbeat plus current running task, if any.
+
+    Each entry also carries process tracking (pid/cmd/alive) taken from
+    the running task's claim record, plus any recorded death reason.
+    """
     workers: dict = {}
     for t in tasks:
         w = (t.get("worker") or "").strip()
@@ -387,7 +440,9 @@ def summarize_workers(tasks) -> list:
             continue
         e = workers.setdefault(w, {"worker": w, "last_heartbeat": None,
                                    "current_task": None,
-                                   "current_task_text": ""})
+                                   "current_task_text": "",
+                                   "pid": None, "cmd": "",
+                                   "alive": None, "death_reason": ""})
         try:
             hb = int(t.get("heartbeat_at") or 0) or None
         except (TypeError, ValueError):
@@ -397,7 +452,200 @@ def summarize_workers(tasks) -> list:
         if t.get("status") == "running":
             e["current_task"] = t["id"]
             e["current_task_text"] = str(t.get("text", ""))[:120]
+            try:
+                pid = int(t.get("worker_pid")) \
+                    if t.get("worker_pid") is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            e["pid"] = pid
+            e["cmd"] = str(t.get("worker_cmd") or "")[:500]
+            e["alive"] = is_process_alive(pid) if pid else None
+            e["death_reason"] = str(t.get("death_reason") or "")
     return sorted(workers.values(), key=lambda e: e["worker"])
+
+
+# ---------------------------------------------------------------------------
+# Worker observability: per-task output logs + process death detection
+# ---------------------------------------------------------------------------
+
+def log_path(task_id: str) -> Path:
+    """Log file for a task's worker output (server is the only writer)."""
+    safe = "".join(c for c in str(task_id or "") if c.isalnum() or c in "-_")
+    return DATA / LOGS_DIRNAME / ((safe or "unknown") + ".log")
+
+
+def append_task_log(task_id: str, text: str) -> int:
+    """Append worker output to the per-task log. Returns file size.
+
+    Trims oldest output past LOG_MAX_BYTES so one chatty worker cannot
+    fill the disk.
+    """
+    d = DATA / LOGS_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    f = log_path(task_id)
+    chunk = str(text or "")
+    with open(f, "a") as fh:
+        fh.write(chunk if chunk.endswith("\n") else chunk + "\n")
+    try:
+        if f.stat().st_size > LOG_MAX_BYTES:
+            lines = f.read_text(errors="replace").splitlines()
+            keep = lines[-(LOG_MAX_BYTES // 100):]
+            f.write_text("\n".join(keep) + "\n")
+    except OSError:
+        pass
+    try:
+        return f.stat().st_size
+    except OSError:
+        return 0
+
+
+def read_task_log(task_id: str, lines: int = 100) -> dict:
+    """Tail a task's worker output. Returns {lines, truncated, size}."""
+    try:
+        lines = max(1, min(LOG_TAIL_MAX, int(lines)))
+    except (TypeError, ValueError):
+        lines = 100
+    f = log_path(task_id)
+    try:
+        size = f.stat().st_size
+    except OSError:
+        return {"task_id": str(task_id), "lines": [],
+                "truncated": False, "size": 0}
+    with open(f, errors="replace") as fh:
+        all_lines = fh.read().splitlines()
+    tail = all_lines[-lines:]
+    return {"task_id": str(task_id), "lines": tail,
+            "truncated": len(all_lines) > len(tail), "size": size}
+
+
+def is_process_alive(pid) -> bool:
+    """True if a local process with this PID exists (kill(pid, 0))."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours
+    except OSError:
+        return False
+    return True
+
+
+def record_worker_death(task, exit_code=None, tail="", now=None) -> dict:
+    """Record a worker death on a running task: exit code, last output,
+    and timestamp. Marks the task failed (it produced no result) while
+    preserving any partial output already posted."""
+    now = int(now if now is not None else time.time())
+    try:
+        code = int(exit_code) if exit_code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    last = str(tail or "").strip()[-2000:]
+    reason = (f"worker process (pid {task.get('worker_pid')}) exited "
+              f"with code {code} at "
+              f"{time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(now))} "
+              f"without completing the task.")
+    task["exit_code"] = code
+    task["death_at"] = now
+    task["death_reason"] = reason
+    if task.get("status") == "running":
+        note = reason + (f"\nLast output:\n{last}" if last else
+                         "\nNo output captured.")
+        prev = (task.get("result") or "").strip()
+        task["result"] = (((prev + "\n\n") if prev else "") + note)[:20000]
+        task["status"] = "failed"
+        task["finished_at"] = now
+    return task
+
+
+def worker_status(workers: dict, tasks, worker_id: str, now=None) -> dict | None:
+    """Status for one worker: process alive?, last heartbeat, current task,
+    plus death reason when its process exited. None if never seen."""
+    now = int(now if now is not None else time.time())
+    w = str(worker_id or "").strip()
+    reg = (workers or {}).get(w)
+    cur, cur_text, death, pid, cmd = None, "", "", None, ""
+    for t in tasks or []:
+        if (t.get("worker") or "").strip() != w:
+            continue
+        if t.get("status") == "running":
+            cur = t["id"]
+            cur_text = str(t.get("text", ""))[:120]
+            try:
+                pid = int(t.get("worker_pid")) \
+                    if t.get("worker_pid") is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            cmd = str(t.get("worker_cmd") or "")[:500]
+            death = str(t.get("death_reason") or "")
+        elif str(t.get("death_reason") or "") and not death:
+            death = str(t.get("death_reason"))
+    if reg is None and cur is None:
+        # Fall back to any historical task row for this worker name.
+        seen = any((t.get("worker") or "").strip() == w for t in tasks or [])
+        if not seen:
+            return None
+    try:
+        hb = int((reg or {}).get("last_heartbeat") or 0) or None
+    except (TypeError, ValueError):
+        hb = None
+    if pid is None and reg is not None:
+        try:
+            pid = int(reg.get("pid")) if reg.get("pid") is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        cmd = cmd or str(reg.get("cmd") or "")[:500]
+    alive = is_process_alive(pid) if pid else None
+    if reg is not None and not death:
+        death = str(reg.get("death_reason") or "")
+    return {"worker": w, "pid": pid, "cmd": cmd,
+            "alive": alive, "last_heartbeat": hb,
+            "heartbeat_stale": (hb is None or now - hb >= HEARTBEAT_STALE),
+            "current_task": cur, "current_task_text": cur_text,
+            "death_reason": death, "now": now}
+
+
+def note_worker(workers: dict, worker: str, task_id=None, pid=None,
+                cmd="", now=None, exit_code=None, death_reason="") -> dict:
+    """Upsert the server-side worker registry entry (data/workers.json)."""
+    now = int(now if now is not None else time.time())
+    w = str(worker or "").strip()[:80]
+    if not w:
+        return {}
+    e = workers.setdefault(w, {"worker": w, "pid": None, "cmd": "",
+                               "started_at": now, "last_heartbeat": now,
+                               "current_task": None,
+                               "exit_code": None, "death_reason": "",
+                               "death_at": None})
+    if pid is not None:
+        try:
+            e["pid"] = int(pid)
+        except (TypeError, ValueError):
+            pass
+    if cmd:
+        e["cmd"] = str(cmd)[:500]
+    e["last_heartbeat"] = now
+    if task_id is not None:
+        e["current_task"] = task_id
+        if task_id is not None and exit_code is None:
+            e["exit_code"] = None
+            e["death_reason"] = ""
+            e["death_at"] = None
+    if exit_code is not None:
+        try:
+            e["exit_code"] = int(exit_code)
+        except (TypeError, ValueError):
+            e["exit_code"] = None
+    if death_reason:
+        e["death_reason"] = str(death_reason)[:1000]
+        e["death_at"] = now
+    return e
 
 
 def filter_tasks(tasks, status="") -> list:
@@ -421,6 +669,253 @@ def paginate(items, page=1, per_page=20):
     total = len(items)
     start = (page - 1) * per_page
     return items[start:start + per_page], page, per_page, total
+
+
+# ---------------------------------------------------------------------------
+# Persistent monitors (never auto-disable — explicit removal only)
+# ---------------------------------------------------------------------------
+
+MONITOR_TYPES = ("task-liveness", "stall-detection")
+MONITOR_MIN_INTERVAL = 5   # seconds; shorter intervals are clamped, not refused
+MONITOR_TICK = 5           # seconds between due-checks in monitors_forever()
+
+
+def monitor_log(event: str, detail: str = "") -> None:
+    """Append one JSON line to the persistent monitor log (data/monitors.log).
+
+    Monitor history lives on disk, not just in memory, so it survives
+    restarts. This log is append-only; nothing here ever truncates it.
+    """
+    DATA.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "event": event,
+        "detail": str(detail)[:1000],
+    })
+    with open(DATA / "monitors.log", "a") as fh:
+        fh.write(line + "\n")
+
+
+def load_monitors():
+    """Read the monitor registry (list of dicts)."""
+    return load_json("monitors.json", [])
+
+
+def save_monitors(monitors) -> None:
+    """Persist the monitor registry."""
+    save_json("monitors.json", monitors)
+
+
+def normalize_monitor_type(value) -> str:
+    """Coerce a monitor type, defaulting to task-liveness."""
+    v = str(value or "task-liveness").strip().lower()
+    return v if v in MONITOR_TYPES else ""
+
+
+def create_monitor(monitors, name, mtype, interval, target="", now=None):
+    """Add a monitor to the registry. Returns (monitor, error).
+
+    Monitors start active and stay active: nothing in this codebase
+    deactivates or deletes them except remove_monitor (explicit DELETE).
+    """
+    now = int(now if now is not None else time.time())
+    name = str(name or "").strip()[:80]
+    if not name:
+        return None, "missing name"
+    if any(m.get("name") == name for m in monitors):
+        return None, "monitor already exists"
+    mtype = normalize_monitor_type(mtype)
+    if not mtype:
+        return None, "unknown type (want task-liveness or stall-detection)"
+    try:
+        interval = int(interval)
+    except (TypeError, ValueError):
+        interval = 60
+    interval = max(MONITOR_MIN_INTERVAL, min(86400, interval))
+    mon = {
+        "name": name,
+        "type": mtype,
+        "interval": interval,
+        "target": str(target or "").strip()[:80],
+        "active": True,
+        "created_at": now,
+        "last_check": None,
+        "next_check": now + interval,
+        "last_result": "",
+        "check_count": 0,
+    }
+    monitors.append(mon)
+    return mon, None
+
+
+def remove_monitor(monitors, name) -> bool:
+    """Delete a monitor by name. The ONLY way a monitor goes away."""
+    for i, m in enumerate(monitors):
+        if m.get("name") == name:
+            del monitors[i]
+            return True
+    return False
+
+
+def enrich_monitor(m, now=None) -> dict:
+    """Copy of a monitor plus guaranteed active/last/next check fields."""
+    now = int(now if now is not None else time.time())
+    out = dict(m)
+    out["active"] = True  # persistent monitors are always active while listed
+    out["last_check"] = m.get("last_check")
+    nxt = m.get("next_check")
+    try:
+        out["next_check"] = int(nxt) if nxt is not None else None
+    except (TypeError, ValueError):
+        out["next_check"] = None
+    if out["next_check"] is None:
+        try:
+            out["next_check"] = int(m.get("created_at", now)) + int(
+                m.get("interval", 60))
+        except (TypeError, ValueError):
+            out["next_check"] = now + 60
+    return out
+
+
+def _monitor_scope(tasks, target):
+    """Running tasks watched by a monitor (target id, or all when blank)."""
+    running = [t for t in tasks if t.get("status") == "running"]
+    tgt = str(target or "").strip()
+    if not tgt or tgt.lower() == "all":
+        return running
+    return [t for t in running if t.get("id") == tgt]
+
+
+def check_task_liveness(tasks, target="", now=None) -> dict:
+    """Task-liveness: every running task in scope must show heartbeat/output.
+
+    Alive = fresh worker heartbeat, recent progress note, or posted output.
+    Returns {"ok", "checked", "alive", "stale", "summary"}.
+    """
+    now = int(now if now is not None else time.time())
+    scope = _monitor_scope(tasks, target)
+    alive, stale = [], []
+    for t in scope:
+        try:
+            hb = int(t.get("heartbeat_at") or 0)
+        except (TypeError, ValueError):
+            hb = 0
+        has_signal = ((hb and now - hb < HEARTBEAT_STALE)
+                      or bool((t.get("progress") or []))
+                      or bool((t.get("result") or "").strip()))
+        (alive if has_signal else stale).append(t.get("id"))
+    ok = not stale
+    return {
+        "ok": ok,
+        "checked": len(scope),
+        "alive": alive,
+        "stale": stale,
+        "summary": ("all %d running task(s) alive" % len(scope)
+                    if ok else
+                    "%d of %d running task(s) stale: %s"
+                    % (len(stale), len(scope), ", ".join(stale))),
+    }
+
+
+def check_stall(tasks, target="", interval=60, now=None) -> dict:
+    """Stall-detection with the 2x rule: a running task is stalled when its
+    time since last activity exceeds 2x the monitor interval.
+
+    Last activity = latest of heartbeat_at (progress notes refresh it) and
+    started_at. Returns {"ok", "checked", "stalled", "active", "summary"}.
+    """
+    now = int(now if now is not None else time.time())
+    try:
+        interval = max(MONITOR_MIN_INTERVAL, int(interval))
+    except (TypeError, ValueError):
+        interval = 60
+    scope = _monitor_scope(tasks, target)
+    stalled, active = [], []
+    for t in scope:
+        try:
+            hb = int(t.get("heartbeat_at") or 0)
+        except (TypeError, ValueError):
+            hb = 0
+        try:
+            sa = int(t.get("started_at") or 0)
+        except (TypeError, ValueError):
+            sa = 0
+        last = max(hb, sa)
+        (stalled if now - last > 2 * interval else active).append(t.get("id"))
+    ok = not stalled
+    return {
+        "ok": ok,
+        "checked": len(scope),
+        "stalled": stalled,
+        "active": active,
+        "summary": ("no stalls (%d running task(s) within 2x interval)"
+                    % len(scope) if ok else
+                    "stalled: %s (silent >2x interval %ds)"
+                    % (", ".join(stalled), interval)),
+    }
+
+
+def run_monitor_check(mon, tasks, now=None) -> dict:
+    """Run one monitor's check against a task list. Pure: no I/O."""
+    now = int(now if now is not None else time.time())
+    if mon.get("type") == "stall-detection":
+        return check_stall(tasks, mon.get("target", ""),
+                           mon.get("interval", 60), now)
+    return check_task_liveness(tasks, mon.get("target", ""), now)
+
+
+def monitors_tick(monitors, tasks, now=None) -> bool:
+    """Run every due monitor, log results, reschedule. Returns True if the
+    registry changed (caller should save it).
+
+    NEVER disables or removes a monitor — not on failure, not on empty
+    scope, not on check errors. Errors are logged and the monitor stays
+    active with its next check rescheduled.
+    """
+    now = int(now if now is not None else time.time())
+    changed = False
+    for mon in monitors:
+        try:
+            nxt = mon.get("next_check")
+            nxt = int(nxt) if nxt is not None else now
+        except (TypeError, ValueError):
+            nxt = now
+        if now < nxt:
+            continue
+        try:
+            res = run_monitor_check(mon, tasks, now)
+            mon["last_result"] = res.get("summary", "")[:500]
+            monitor_log("check",
+                        f"{mon.get('name')} [{mon.get('type')}] {res.get('summary', '')}")
+        except Exception as e:
+            mon["last_result"] = f"check error (stays active): {e}"[:500]
+            monitor_log("check-error", f"{mon.get('name')}: {e}")
+        mon["active"] = True
+        mon["last_check"] = now
+        try:
+            step = max(MONITOR_MIN_INTERVAL, int(mon.get("interval", 60)))
+        except (TypeError, ValueError):
+            step = 60
+        mon["next_check"] = now + step
+        mon["check_count"] = int(mon.get("check_count") or 0) + 1
+        changed = True
+    return changed
+
+
+def monitors_forever() -> None:
+    """Background monitor loop (daemon thread): checks never auto-disable."""
+    while True:
+        time.sleep(MONITOR_TICK)
+        try:
+            with LOCK:
+                monitors = load_monitors()
+                if not monitors:
+                    continue
+                tasks = load_json("tasks.json", [])
+                if monitors_tick(monitors, tasks):
+                    save_monitors(monitors)
+        except Exception:
+            pass  # never take down the server over a monitor check
 
 
 def git(args: list, cwd: Path) -> str:
@@ -472,7 +967,14 @@ class H(BaseHTTPRequestHandler):
         r = self.role()
         if r == "operator":
             return True
-        return r == "orchestrator" and path in ORCH_PATHS
+        if r != "orchestrator":
+            return False
+        if path in ORCH_PATHS:
+            return True
+        # Dynamic per-task / per-worker reads (log tail, worker status).
+        # Approve/reject stay operator-only despite the /api/tasks/ prefix.
+        return (path.startswith(ORCH_PREFIXES)
+                and path not in ORCH_PREFIX_DENY)
 
     def body(self) -> dict:
         n = int(self.headers.get("Content-Length", "0"))
@@ -548,10 +1050,47 @@ class H(BaseHTTPRequestHandler):
             return self.send_json({"workers": summarize_workers(tasks),
                                    "now": int(time.time())})
 
+        if path.startswith("/api/workers/") and path.endswith("/status"):
+            # GET /api/workers/<id>/status: process alive?, last
+            # heartbeat, current task, death reason if exited.
+            from urllib.parse import unquote
+            wid = unquote(path[len("/api/workers/"):-len("/status")]).strip()
+            if not wid:
+                return self.send_json({"error": "missing worker"}, 400)
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                workers = load_json("workers.json", {})
+            st = worker_status(workers, tasks, wid)
+            if st is None:
+                return self.send_json({"error": "unknown worker"}, 404)
+            return self.send_json(st)
+
+        if path.startswith("/api/tasks/") and path.endswith("/log"):
+            # GET /api/tasks/<id>/log?lines=N: tail worker output.
+            from urllib.parse import unquote
+            tid = unquote(path[len("/api/tasks/"):-len("/log")]).strip()
+            if not tid:
+                return self.send_json({"error": "missing id"}, 400)
+            try:
+                n = int(q.get("lines", ["100"])[0])
+            except (TypeError, ValueError):
+                n = 100
+            return self.send_json(read_task_log(tid, n))
+
         if path == "/api/goals":
             with LOCK:
                 goals = load_json("goals.json", [])
             return self.send_json({"goals": list(reversed(goals))[:50]})
+
+        if path == "/api/monitors":
+            # Persistent monitors: always active while listed. Operator only.
+            if self.role() != "operator":
+                return self.send_json({"error": "forbidden"}, 403)
+            with LOCK:
+                monitors = load_monitors()
+            now = int(time.time())
+            return self.send_json(
+                {"monitors": [enrich_monitor(m, now) for m in monitors]})
 
         if path == "/api/git/status":
             p = safe_path(q.get("path", [""])[0]) or WORKSPACE
@@ -658,6 +1197,9 @@ class H(BaseHTTPRequestHandler):
                 "priority": normalize_priority(data.get("priority")),
                 "status": "queued", "result": "", "diff": "", "wt": "",
                 "worker": "", "heartbeat_at": None, "progress": [],
+                "worker_pid": None, "worker_cmd": "",
+                "worker_started_at": None, "exit_code": None,
+                "death_at": None, "death_reason": "",
             }
             with LOCK:
                 tasks = load_json("tasks.json", [])
@@ -668,28 +1210,93 @@ class H(BaseHTTPRequestHandler):
 
         if u.path == "/api/tasks/claim":
             # Worker picks up the highest-priority queued task (FIFO inside
-            # a priority). Records which worker claimed it (task.worker).
+            # a priority). Records worker identity + process tracking
+            # (PID, start time, command) on the task and in workers.json,
+            # and opens the per-task output log.
             with LOCK:
                 tasks = load_json("tasks.json", [])
-                t = claim_task(tasks, data.get("worker", ""))
+                t = claim_task(tasks, data.get("worker", ""),
+                               pid=data.get("pid"), cmd=data.get("cmd", ""))
                 if t is None:
                     return self.send_json({"ok": True, "task": None})
+                workers = load_json("workers.json", {})
+                note_worker(workers, t.get("worker"), task_id=t["id"],
+                            pid=t.get("worker_pid"), cmd=t.get("worker_cmd"))
+                save_json("workers.json", workers)
                 save_json("tasks.json", tasks)
-                return self.send_json({"ok": True, "task": enrich_task(t)})
+            append_task_log(
+                t["id"],
+                f"worker {t.get('worker')} claimed task "
+                f"(pid {t.get('worker_pid')}) cmd: {t.get('worker_cmd')}")
+            return self.send_json({"ok": True, "task": enrich_task(t)})
 
         if u.path == "/api/tasks/heartbeat":
-            # Worker sign of life while running: {id, worker?}.
+            # Worker sign of life while running: {id, worker?, pid?}.
             tid = str(data.get("id", ""))
             if not tid:
                 return self.send_json({"error": "missing id"}, 400)
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                t = heartbeat_task(tasks, tid, data.get("worker", ""),
+                                   pid=data.get("pid"))
+                if t is None:
+                    return self.send_json({"error": "no task"}, 404)
+                workers = load_json("workers.json", {})
+                note_worker(workers, t.get("worker"), task_id=tid,
+                            pid=t.get("worker_pid"))
+                save_json("workers.json", workers)
+                save_json("tasks.json", tasks)
+                return self.send_json({"ok": True,
+                                       "heartbeat_at": t["heartbeat_at"]})
+
+        if u.path == "/api/tasks/log":
+            # Worker output streaming: {id, text}. Appends to the
+            # per-task log file (server is the only writer) and counts
+            # as a heartbeat so streaming workers look alive.
+            tid = str(data.get("id", ""))
+            text = str(data.get("text", ""))
+            if not tid:
+                return self.send_json({"error": "missing id"}, 400)
+            if not text.strip():
+                return self.send_json({"error": "empty text"}, 400)
             with LOCK:
                 tasks = load_json("tasks.json", [])
                 t = heartbeat_task(tasks, tid, data.get("worker", ""))
                 if t is None:
                     return self.send_json({"error": "no task"}, 404)
                 save_json("tasks.json", tasks)
-                return self.send_json({"ok": True,
-                                       "heartbeat_at": t["heartbeat_at"]})
+            size = append_task_log(tid, text[:10000])
+            return self.send_json({"ok": True,
+                                   "heartbeat_at": t["heartbeat_at"],
+                                   "size": size})
+
+        if u.path == "/api/tasks/death":
+            # Death report: {id, exit_code?, tail?}. The worker's
+            # supervisor posts this when the worker process exits
+            # without completing the task.
+            tid = str(data.get("id", ""))
+            if not tid:
+                return self.send_json({"error": "missing id"}, 400)
+            tail = str(data.get("tail", ""))
+            if not tail:
+                tail = "\n".join(read_task_log(tid, 20)["lines"])
+            with LOCK:
+                tasks = load_json("tasks.json", [])
+                t = next((x for x in tasks if x["id"] == tid), None)
+                if t is None:
+                    return self.send_json({"error": "no task"}, 404)
+                if t.get("status") not in ("queued", "running"):
+                    return self.send_json({"error": "task not active"}, 400)
+                record_worker_death(t, data.get("exit_code"), tail)
+                workers = load_json("workers.json", {})
+                note_worker(workers, t.get("worker"),
+                            exit_code=t.get("exit_code"),
+                            death_reason=t.get("death_reason"))
+                save_json("workers.json", workers)
+                save_json("tasks.json", tasks)
+            audit("worker-death", f"{tid} pid={t.get('worker_pid')} "
+                                 f"code={t.get('exit_code')}")
+            return self.send_json({"ok": True, "task": enrich_task(t)})
 
         if u.path == "/api/tasks/progress":
             # Incremental progress on a long task: {id, message}.
@@ -731,6 +1338,11 @@ class H(BaseHTTPRequestHandler):
                         for k in ("status", "result", "diff", "wt", "worker"):
                             if k in data:
                                 t[k] = str(data[k])[:20000]
+                        if "exit_code" in data:
+                            try:
+                                t["exit_code"] = int(data["exit_code"])
+                            except (TypeError, ValueError):
+                                t["exit_code"] = None
                         if "heartbeat_at" in data:
                             try:
                                 t["heartbeat_at"] = int(data["heartbeat_at"])
@@ -739,12 +1351,32 @@ class H(BaseHTTPRequestHandler):
                         if t.get("status") in (TERMINAL_STATUSES
                                                + ("awaiting_approval",)):
                             t["finished_at"] = int(time.time())
+                            if (t.get("exit_code") not in (None, 0)
+                                    and not t.get("death_reason")):
+                                t["death_reason"] = (
+                                    f"worker process (pid "
+                                    f"{t.get('worker_pid')}) exited with "
+                                    f"code {t.get('exit_code')}.")
+                                t["death_at"] = t["finished_at"]
+                        if t.get("status") in TERMINAL_STATUSES:
+                            workers = load_json("workers.json", {})
+                            e = note_worker(
+                                workers, t.get("worker"),
+                                exit_code=t.get("exit_code"))
+                            if t.get("death_reason"):
+                                e["death_reason"] = t["death_reason"][:1000]
+                                e["death_at"] = t.get("death_at")
+                            save_json("workers.json", workers)
                         save_json("tasks.json", tasks)
                         return self.send_json({"ok": True})
             return self.send_json({"error": "no task"}, 404)
 
         if u.path in ("/api/tasks/approve", "/api/tasks/reject"):
             # Operator only: apply or discard an approve-mode diff.
+            # (Explicit check: the /api/tasks/ orchestrator prefix must
+            # never open these two.)
+            if self.role() != "operator":
+                return self.send_json({"error": "forbidden"}, 403)
             with LOCK:
                 tasks = load_json("tasks.json", [])
                 task = next((t for t in tasks
@@ -780,6 +1412,28 @@ class H(BaseHTTPRequestHandler):
                 save_json("goals.json", goals)
             return self.send_json({"ok": True, "goal": goal})
 
+        if u.path == "/api/monitors":
+            # Operator only: create a persistent monitor.
+            # Body: {name, type, interval, target}.
+            if self.role() != "operator":
+                return self.send_json({"error": "forbidden"}, 403)
+            with LOCK:
+                monitors = load_monitors()
+                mon, err = create_monitor(
+                    monitors, data.get("name"), data.get("type"),
+                    data.get("interval", 60), data.get("target", ""))
+                if err == "monitor already exists":
+                    return self.send_json({"error": err}, 409)
+                if err:
+                    return self.send_json({"error": err}, 400)
+                save_monitors(monitors)
+            monitor_log("create",
+                        f"{mon['name']} [{mon['type']}] every {mon['interval']}s"
+                        f" target={mon['target'] or 'all'}")
+            audit("monitor-create", mon["name"])
+            return self.send_json({"ok": True,
+                                   "monitor": enrich_monitor(mon)})
+
         if u.path == "/api/goals/update":
             with LOCK:
                 goals = load_json("goals.json", [])
@@ -796,6 +1450,30 @@ class H(BaseHTTPRequestHandler):
                         return self.send_json({"ok": True})
             return self.send_json({"error": "no goal"}, 404)
 
+        return self.send_json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        if not self.authed("/api/monitors"):
+            return self.send_json({"error": "unauthorized"}, 401)
+        # Explicit removal is the ONLY way a monitor goes away.
+        if u.path == "/api/monitors" or u.path == "/api/monitors/":
+            return self.send_json({"error": "missing monitor name"}, 400)
+        if u.path.startswith("/api/monitors/"):
+            if self.role() != "operator":
+                return self.send_json({"error": "forbidden"}, 403)
+            from urllib.parse import unquote
+            name = unquote(u.path[len("/api/monitors/"):]).strip()
+            if not name:
+                return self.send_json({"error": "missing monitor name"}, 400)
+            with LOCK:
+                monitors = load_monitors()
+                if not remove_monitor(monitors, name):
+                    return self.send_json({"error": "no monitor"}, 404)
+                save_monitors(monitors)
+            monitor_log("delete", name)
+            audit("monitor-delete", name)
+            return self.send_json({"ok": True, "deleted": name})
         return self.send_json({"error": "not found"}, 404)
 
     def serve_static(self, path):
@@ -828,6 +1506,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     DATA.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=sweep_forever, daemon=True).start()
+    threading.Thread(target=monitors_forever, daemon=True).start()
     print(f"Muse Code CLI PWA on http://127.0.0.1:{PORT} "
           f"workspace={WORKSPACE}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
