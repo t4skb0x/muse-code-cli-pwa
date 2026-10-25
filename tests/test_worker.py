@@ -8,6 +8,7 @@ heartbeat poster.
 Run:  python3 -m unittest discover -s tests -v
 """
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -22,6 +23,7 @@ import worker  # noqa: E402
 
 
 class TimeoutTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "bash required")  # Field fix (Windows): no bash here
     def test_partial_output_decodes_bytes(self):
         try:
             worker.sh(["bash", "-c", "echo PARTIAL-OUT; sleep 5"],

@@ -1199,7 +1199,11 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json({"error": "empty cmd"}, 400)
             audit("exec", cmd)
             try:
-                r = subprocess.run(["/bin/bash", "-lc", cmd], cwd=cwd,
+                if os.name == "nt":  # Field fix (Windows): platform shell
+                    shell = ["powershell", "-NoProfile", "-Command", cmd]
+                else:
+                    shell = ["/bin/bash", "-lc", cmd]
+                r = subprocess.run(shell, cwd=cwd,
                                    capture_output=True, text=True,
                                    timeout=EXEC_TIMEOUT)
                 return self.send_json(
